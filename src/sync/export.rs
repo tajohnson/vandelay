@@ -125,6 +125,8 @@ struct Net {
     limits: Limits,
     session: Session,
     dry_run: bool,
+    update_matched: bool,
+    prune: bool,
 }
 
 fn has_rows(conn: &Connection, ty: ObjectType) -> bool {
@@ -148,6 +150,8 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
         limits: connected.limits,
         session: connected.session.clone(),
         dry_run: ctx.dry_run(),
+        update_matched: config.update_matched,
+        prune: config.prune,
     };
 
     let work = work_list(&ctx.conn, &config, &connected, &logger);

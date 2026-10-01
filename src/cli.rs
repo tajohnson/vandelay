@@ -340,6 +340,12 @@ struct ExportArgs {
     #[arg(long, help = "Skip the interactive --prune confirmation")]
     yes: bool,
 
+    #[arg(
+        long,
+        help = "Pair emails one-to-one by message identity, update keywords and mailboxes of matched emails, create unpaired ones (and, with --prune, destroy unpaired target emails)"
+    )]
+    update_matched: bool,
+
     #[command(flatten)]
     global: GlobalArgs,
 
@@ -870,6 +876,7 @@ fn resolve_export(args: ExportArgs) -> Result<Action, Error> {
             objects,
             prune: args.prune,
             yes: args.yes,
+            update_matched: args.update_matched,
         },
     ))
 }

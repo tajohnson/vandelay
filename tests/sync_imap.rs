@@ -357,6 +357,7 @@ fn imap_imported_archive_exports_via_jmap() {
         objects: None,
         prune: false,
         yes: false,
+        update_matched: false,
     };
     let first = sync::export::run(export_common, export_cfg).expect("first export");
     assert!(!first.any_failed(), "first export had failures: {first:?}");
@@ -381,6 +382,7 @@ fn imap_imported_archive_exports_via_jmap() {
         objects: None,
         prune: false,
         yes: false,
+        update_matched: false,
     };
     let second = sync::export::run(export_common2, export_cfg2).expect("second export");
     for (name, counts) in &second.per_type {

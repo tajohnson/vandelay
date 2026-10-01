@@ -155,6 +155,7 @@ fn export_email_already_exists_is_matched_not_failed() {
             objects: None,
             prune: false,
             yes: true,
+            update_matched: false,
         },
     )
     .expect("export run");
@@ -296,6 +297,7 @@ fn export_mailbox_name_collision_merges_without_create() {
             objects: None,
             prune: false,
             yes: true,
+            update_matched: false,
         },
     )
     .expect("export run");
@@ -454,6 +456,7 @@ fn export_mailbox_already_exists_maps_existing_id() {
             objects: None,
             prune: false,
             yes: true,
+            update_matched: false,
         },
     )
     .expect("export run");
@@ -611,6 +614,7 @@ fn email_export_sends_one_email_per_import_call() {
             objects: None,
             prune: false,
             yes: true,
+            update_matched: false,
         },
     )
     .expect("export run");
@@ -778,6 +782,7 @@ fn export_email_blob_not_found_reuploads_and_retries() {
             objects: None,
             prune: false,
             yes: true,
+            update_matched: false,
         },
     )
     .expect("export run");
@@ -851,6 +856,7 @@ fn export_cfg_objects(base: &str, objects: Vec<ObjectType>) -> ExportConfig {
         objects: Some(objects),
         prune: false,
         yes: true,
+        update_matched: false,
     }
 }
 
@@ -4318,6 +4324,7 @@ fn run_export(archive: &Path, base: &str, max_retries: u32) -> sync::Summary {
             objects: None,
             prune: false,
             yes: true,
+            update_matched: false,
         },
     )
     .expect("export run")

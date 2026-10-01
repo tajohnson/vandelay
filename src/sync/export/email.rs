@@ -13,7 +13,7 @@ use super::{Maps, Net, Plan, Uploader};
 use crate::error::Error;
 use crate::jmap::error::JmapError;
 use crate::jmap::request::{
-    MethodCall, Request, check_method_error, get_objects, retry_method_call,
+    MethodCall, Request, SetRequest, check_method_error, get_objects, retry_method_call, set_call,
 };
 use crate::jmap::retry::MethodCallKind;
 use crate::jmap::wire::JmapId;
@@ -116,6 +116,21 @@ pub fn reconcile(
         .collect();
     let local_keys = email_keys(&local_indices);
 
+    if net.update_matched {
+        let target_ids: Vec<Option<String>> = target_min.iter().map(jid).collect();
+        return reconcile_paired(
+            ctx,
+            net,
+            maps,
+            counts,
+            logger,
+            &target_ids,
+            &email_keys(&indices),
+            &local,
+            &local_keys,
+        );
+    }
+
     let mut uploader = Uploader::new(net, &ctx.conn);
     for (i, key) in local_keys.iter().enumerate() {
         if target_keys.contains(key) {
@@ -127,6 +142,189 @@ pub fn reconcile(
     }
 
     Ok(Plan::default())
+}
+
+/// (archive row index, its mailboxIds on the target, paired target email id)
+type Paired = (usize, Option<Map<String, Value>>, String);
+
+/// `--update-matched`: pairs archive emails with target emails one-to-one per
+/// identity key (a key can repeat, e.g. one message filed in two folders as two
+/// emails). Pairs whose mailboxes or keywords differ are updated to the archive's
+/// state, archive emails left unpaired are created, and target emails left
+/// unpaired become prune candidates (destroyed only with `--prune`). Pairing
+/// prefers a target email already in the same mailboxes.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_paired(
+    ctx: &Context,
+    net: &Net,
+    maps: &mut Maps,
+    counts: &mut TypeCounts,
+    logger: &Logger,
+    target_ids: &[Option<String>],
+    target_keys: &[EmailKey],
+    local: &[(i64, EmailRow)],
+    local_keys: &[EmailKey],
+) -> Result<Plan, Error> {
+    let ty = ObjectType::Email;
+
+    // Current mailboxes and keywords of every target email.
+    let ids: Vec<JmapId> = target_ids.iter().flatten().cloned().map(JmapId).collect();
+    let mut state: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+    if !ids.is_empty() {
+        let got = get_objects::<Value>(
+            &net.client,
+            &net.api,
+            &net.account,
+            ty.jmap_name(),
+            &ids,
+            Some(&["mailboxIds", "keywords"]),
+            &net.limits,
+        )
+        .map_err(Error::from)?;
+        for v in &got.list {
+            if let Some(id) = jid(v) {
+                state.insert(
+                    id,
+                    (true_keys(v.get("mailboxIds"), false), true_keys(v.get("keywords"), true)),
+                );
+            }
+        }
+    }
+
+    let mut by_key: HashMap<&EmailKey, Vec<String>> = HashMap::new();
+    for (key, id) in target_keys.iter().zip(target_ids) {
+        if let Some(id) = id {
+            by_key.entry(key).or_default().push(id.clone());
+        }
+    }
+
+    let mut groups: Vec<(&EmailKey, Vec<usize>)> = Vec::new();
+    let mut group_of: HashMap<&EmailKey, usize> = HashMap::new();
+    for (i, key) in local_keys.iter().enumerate() {
+        let g = *group_of.entry(key).or_insert_with(|| {
+            groups.push((key, Vec::new()));
+            groups.len() - 1
+        });
+        groups[g].1.push(i);
+    }
+
+    let mut updates = Map::new();
+    let mut unpaired_local: Vec<usize> = Vec::new();
+    for (key, locals) in &groups {
+        let mut free: Vec<String> = by_key.remove(*key).unwrap_or_default();
+        // First pass: a target email in the same mailboxes; second pass: whatever is left.
+        let mut pairs: Vec<Paired> = Vec::new();
+        let mut rest: Vec<(usize, Option<Map<String, Value>>)> = Vec::new();
+        for &i in locals {
+            let mids = build_mailbox_ids(&local[i].1, maps);
+            let want = mids.as_ref().map(|m| sorted(m.keys().cloned().collect()));
+            let pos = want.as_ref().and_then(|w| {
+                free.iter()
+                    .position(|t| state.get(t).is_some_and(|(mb, _)| mb == w))
+            });
+            match pos {
+                Some(p) => pairs.push((i, mids, free.remove(p))),
+                None => rest.push((i, mids)),
+            }
+        }
+        for (i, mids) in rest {
+            if free.is_empty() {
+                unpaired_local.push(i);
+            } else {
+                pairs.push((i, mids, free.remove(0)));
+            }
+        }
+        // Targets left for this key are copies the archive no longer has.
+        by_key.insert(*key, free);
+
+        for (i, mids, tid) in pairs {
+            let Some(mids) = mids else {
+                logger.warn(&format!(
+                    "Email/set update {tid} skipped: mailbox not on target"
+                ));
+                counts.failed += 1;
+                continue;
+            };
+            let kw = build_keywords(&local[i].1);
+            let want_mb = sorted(mids.keys().cloned().collect());
+            let want_kw = sorted(kw.keys().map(|k| k.to_ascii_lowercase()).collect());
+            let same = state
+                .get(&tid)
+                .is_some_and(|(mb, k)| *mb == want_mb && *k == want_kw);
+            if same {
+                counts.skipped += 1;
+            } else {
+                updates.insert(
+                    tid,
+                    json!({ "mailboxIds": Value::Object(mids), "keywords": Value::Object(kw) }),
+                );
+            }
+        }
+    }
+
+    if !updates.is_empty() {
+        let n = updates.len() as u64;
+        if net.dry_run {
+            counts.updated += n;
+        } else {
+            match set_call(
+                &net.client,
+                &net.api,
+                &net.account,
+                ty.jmap_name(),
+                SetRequest {
+                    update: Some(Value::Object(updates)),
+                    ..Default::default()
+                },
+                &net.limits,
+            ) {
+                Ok(outcome) => {
+                    counts.updated += outcome.updated.len() as u64;
+                    for (id, err) in &outcome.not_updated {
+                        logger.warn(&format!("Email/set update {id} failed: {err}"));
+                        counts.failed += 1;
+                    }
+                }
+                Err(e) => {
+                    logger.warn(&format!("Email/set update request failed: {e}"));
+                    counts.failed += n;
+                }
+            }
+        }
+    }
+
+    let mut uploader = Uploader::new(net, &ctx.conn);
+    for i in unpaired_local {
+        let (local_id, row) = &local[i];
+        export_one(net, &mut uploader, maps, *local_id, row, counts, logger);
+    }
+
+    let mut plan = Plan::default();
+    if net.prune {
+        plan.prune_candidates = by_key.into_values().flatten().collect();
+        plan.prune_candidates.sort();
+    }
+    Ok(plan)
+}
+
+/// Keys of a JMAP `{key: true}` map, sorted (lowercased for keywords).
+fn true_keys(v: Option<&Value>, lower: bool) -> Vec<String> {
+    let keys = v
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter(|(_, b)| b.as_bool().unwrap_or(false))
+                .map(|(k, _)| if lower { k.to_ascii_lowercase() } else { k.clone() })
+                .collect()
+        })
+        .unwrap_or_default();
+    sorted(keys)
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v.dedup();
+    v
 }
 
 fn build_mailbox_ids(row: &EmailRow, maps: &Maps) -> Option<Map<String, Value>> {

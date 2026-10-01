@@ -361,6 +361,7 @@ fn graph_import_survives_a_full_export_to_stalwart() {
             objects: None,
             prune: false,
             yes: true,
+            update_matched: false,
         },
     )
     .expect("export");

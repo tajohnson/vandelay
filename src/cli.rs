@@ -400,6 +400,23 @@ struct ExportArgs {
     )]
     assume_not_deleted_in_destination: bool,
 
+    #[arg(
+        long,
+        conflicts_with_all = ["assume_not_deleted_in_destination", "create_only"],
+        help = "Email: full one-to-one pass, bypassing the id cache: pair archive and target \
+                emails per message identity (same mailboxes first), set each pair's keywords AND \
+                mailboxes to the archive's, create unpaired archive emails, and with --prune \
+                destroy unpaired target emails (duplicates, deleted at source)"
+    )]
+    update_matched: bool,
+
+    #[arg(
+        long,
+        help = "Email: only create missing emails; never update an existing target email's \
+                keywords (for a pass after the target has gone live)"
+    )]
+    create_only: bool,
+
     #[command(flatten)]
     global: GlobalArgs,
 
@@ -939,6 +956,8 @@ fn resolve_export(args: ExportArgs) -> Result<Action, Error> {
             yes: args.yes,
             acl: args.acl || acl_in_objects,
             assume_not_deleted_in_destination: args.assume_not_deleted_in_destination,
+            update_matched: args.update_matched,
+            create_only: args.create_only,
         },
     ))
 }

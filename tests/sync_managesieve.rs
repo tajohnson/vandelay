@@ -396,6 +396,8 @@ fn managesieve_round_trip_via_jmap_export_converges() {
         yes: false,
         acl: false,
         assume_not_deleted_in_destination: false,
+        update_matched: false,
+        create_only: false,
     };
     let first = sync::export::run(export_common, export_cfg).expect("first export");
     assert!(!first.any_failed(), "first export had failures: {first:?}");
@@ -432,6 +434,8 @@ fn managesieve_round_trip_via_jmap_export_converges() {
         yes: false,
         acl: false,
         assume_not_deleted_in_destination: false,
+        update_matched: false,
+        create_only: false,
     };
     let second = sync::export::run(export_common2, export_cfg2).expect("second export");
     for (name, counts) in &second.per_type {

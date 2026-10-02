@@ -72,6 +72,8 @@ pub struct ExportConfig {
     pub yes: bool,
     pub acl: bool,
     pub assume_not_deleted_in_destination: bool,
+    pub update_matched: bool,
+    pub create_only: bool,
 }
 
 #[derive(Debug, Default, Clone)]

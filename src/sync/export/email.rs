@@ -108,7 +108,7 @@ fn sync_keywords(
     counts: &mut TypeCounts,
     logger: &Logger,
 ) -> Result<Vec<i64>, Error> {
-    if net.dry_run {
+    if net.dry_run || net.create_only {
         return Ok(Vec::new());
     }
     let mut update = Map::new();
@@ -297,6 +297,10 @@ pub fn reconcile(
     // confirms the *surviving* cache entries against the target.
     let (prune_candidates, prune_local_ids) = source_deleted(&local, &cached);
 
+    if net.update_matched {
+        return reconcile_paired(ctx, net, maps, target_row, ty, &local, &cached, counts, logger);
+    }
+
     if !local.is_empty() {
         if let Some(mut plan) = try_state_proven_fast_path(
             ctx, net, maps, target_row, ty, &local, &cached, &synced, &mailbox_labels, counts,
@@ -453,6 +457,232 @@ pub fn reconcile(
         prune_local_ids,
         ..Plan::default()
     })
+}
+
+/// (archive row index, its mailboxIds on the target, paired target email id)
+type Paired = (usize, Option<Map<String, Value>>, String);
+
+/// `--update-matched`: a full, cache-independent one-to-one reconcile.
+///
+/// Archive and target emails are paired per identity key, which can repeat
+/// (one message filed in two folders as two emails, or a duplicate left by a
+/// retried batch import), preferring a target email already in the same
+/// mailboxes. Pairs whose mailboxes or keywords differ get an `Email/set`
+/// update to the archive's state (carries moves, e.g. Inbox -> Trash, which the
+/// keyword-only sync does not); unpaired archive emails are created; unpaired
+/// target emails become prune candidates, destroyed only with `--prune`. The id
+/// cache is rewritten from the pairs, so later runs can take the fast paths.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_paired(
+    ctx: &Context,
+    net: &Net,
+    maps: &mut Maps,
+    target_row: i64,
+    ty: ObjectType,
+    local: &[(i64, EmailRow)],
+    cached: &HashMap<i64, String>,
+    counts: &mut TypeCounts,
+    logger: &Logger,
+) -> Result<Plan, Error> {
+    let threads = ctx.common.threads;
+    let target = target_query_get(net, ty, Some(&["messageId", "mailboxIds", "keywords"]), threads)
+        .map_err(Error::from)?;
+    let mut indices: Vec<EmailIndex> = target.iter().map(server_index).collect();
+    let fallback_ids: Vec<JmapId> = target
+        .iter()
+        .zip(indices.iter())
+        .filter(|(_, i)| i.mids.is_empty())
+        .filter_map(|(v, _)| jid(v).map(JmapId))
+        .collect();
+    if !fallback_ids.is_empty() {
+        let got = get_objects_parallel(
+            net,
+            ty,
+            &fallback_ids,
+            Some(&["messageId", "from", "subject", "sentAt", "to"]),
+            threads,
+            |_| {},
+        )
+        .map_err(Error::from)?;
+        let by_id: HashMap<String, &Value> =
+            got.iter().filter_map(|v| jid(v).map(|i| (i, v))).collect();
+        for (v, slot) in target.iter().zip(indices.iter_mut()) {
+            if let Some(full) = jid(v).and_then(|i| by_id.get(&i)) {
+                *slot = server_index(full);
+            }
+        }
+    }
+    let target_keys = email_keys(&indices);
+
+    let mut state: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+    let mut by_key: HashMap<&EmailKey, Vec<String>> = HashMap::new();
+    for (v, key) in target.iter().zip(&target_keys) {
+        if let Some(id) = jid(v) {
+            state.insert(
+                id.clone(),
+                (true_keys(v.get("mailboxIds"), false), true_keys(v.get("keywords"), true)),
+            );
+            by_key.entry(key).or_default().push(id);
+        }
+    }
+
+    let local_indices: Vec<EmailIndex> =
+        local.iter().map(|(_, r)| index_from_json(&r.message_match)).collect();
+    let local_keys = email_keys(&local_indices);
+    let mut groups: Vec<(&EmailKey, Vec<usize>)> = Vec::new();
+    let mut group_of: HashMap<&EmailKey, usize> = HashMap::new();
+    for (i, key) in local_keys.iter().enumerate() {
+        let g = *group_of.entry(key).or_insert_with(|| {
+            groups.push((key, Vec::new()));
+            groups.len() - 1
+        });
+        groups[g].1.push(i);
+    }
+
+    let mut updates = Map::new();
+    let mut update_kw: HashMap<String, (i64, Vec<String>)> = HashMap::new();
+    let mut pairs_to_cache: Vec<(i64, String)> = Vec::new();
+    let mut baselines: Vec<(i64, Vec<String>)> = Vec::new();
+    let mut to_create: Vec<(i64, &EmailRow)> = Vec::new();
+    for (key, rows) in &groups {
+        let mut free: Vec<String> = by_key.remove(*key).unwrap_or_default();
+        let mut pairs: Vec<Paired> = Vec::new();
+        let mut rest: Vec<(usize, Option<Map<String, Value>>)> = Vec::new();
+        for &i in rows {
+            let mids = build_mailbox_ids(&local[i].1, maps);
+            let want = mids.as_ref().map(|m| sorted(m.keys().cloned().collect()));
+            let pos = want.as_ref().and_then(|w| {
+                free.iter()
+                    .position(|t| state.get(t).is_some_and(|(mb, _)| mb == w))
+            });
+            match pos {
+                Some(p) => pairs.push((i, mids, free.remove(p))),
+                None => rest.push((i, mids)),
+            }
+        }
+        for (i, mids) in rest {
+            if free.is_empty() {
+                to_create.push((local[i].0, &local[i].1));
+            } else {
+                pairs.push((i, mids, free.remove(0)));
+            }
+        }
+        // Target copies left for this key are ones the archive does not have.
+        by_key.insert(*key, free);
+
+        for (i, mids, tid) in pairs {
+            let (local_id, row) = &local[i];
+            crate::progress::advance(1);
+            pairs_to_cache.push((*local_id, tid.clone()));
+            let Some(mids) = mids else {
+                logger.warn(&format!("Email {tid}: not updated, a mailbox is not on the target"));
+                counts.failed += 1;
+                continue;
+            };
+            let norm = normalize_keywords(&row.keywords);
+            let want_mb = sorted(mids.keys().cloned().collect());
+            let want_kw = sorted(norm.iter().map(|k| k.to_ascii_lowercase()).collect());
+            if state.get(&tid).is_some_and(|(mb, k)| *mb == want_mb && *k == want_kw) {
+                counts.skipped += 1;
+                baselines.push((*local_id, norm));
+                continue;
+            }
+            let mut kw = Map::new();
+            for k in &norm {
+                kw.insert(k.clone(), Value::Bool(true));
+            }
+            updates.insert(
+                tid.clone(),
+                json!({ "mailboxIds": Value::Object(mids), "keywords": Value::Object(kw) }),
+            );
+            update_kw.insert(tid, (*local_id, norm));
+        }
+    }
+
+    if !net.dry_run {
+        // Cache rows for archive emails deleted at the source: their target copies
+        // are now unpaired (prune candidates), so the rows are only stale hints.
+        let present: HashSet<i64> = local.iter().map(|(id, _)| *id).collect();
+        let gone: Vec<i64> = cached.keys().filter(|id| !present.contains(id)).copied().collect();
+        if !gone.is_empty() {
+            db::export_ids::delete_many(&ctx.conn, target_row, ty, &gone)
+                .map_err(|e| Error::Partial(e.to_string()))?;
+        }
+        db::export_ids::upsert_many(&ctx.conn, target_row, ty, &pairs_to_cache)
+            .map_err(|e| Error::Partial(e.to_string()))?;
+    }
+
+    if !updates.is_empty() {
+        let n = updates.len() as u64;
+        if net.dry_run {
+            counts.updated += n;
+        } else {
+            match set_call(
+                &net.client,
+                &net.api,
+                &net.account,
+                ty.jmap_name(),
+                SetRequest {
+                    update: Some(Value::Object(updates)),
+                    ..Default::default()
+                },
+                &net.limits,
+            ) {
+                Ok(outcome) => {
+                    for id in &outcome.updated {
+                        if let Some((local_id, norm)) = update_kw.get(id) {
+                            counts.updated += 1;
+                            baselines.push((*local_id, norm.clone()));
+                        }
+                    }
+                    for (id, err) in &outcome.not_updated {
+                        logger.warn(&format!("Email {id}: update failed: {err}"));
+                        counts.failed += 1;
+                    }
+                }
+                Err(e) => {
+                    logger.warn(&format!("Email: update request failed: {e}"));
+                    counts.failed += n;
+                }
+            }
+        }
+    }
+    if !net.dry_run && !baselines.is_empty() {
+        db::export_ids::set_keywords_synced_many(&ctx.conn, target_row, &baselines)
+            .map_err(|e| Error::Partial(e.to_string()))?;
+    }
+
+    create_missing(ctx, net, maps, target_row, ty, &to_create, counts, logger)?;
+    record_state_for_next_run(ctx, net, target_row, logger);
+
+    let mut plan = Plan::default();
+    if net.prune {
+        plan.prune_candidates = by_key.into_values().flatten().collect();
+        plan.prune_candidates.sort();
+        // No local ids: these target emails have no archive row (and so no cache
+        // row to forget once destroyed); forget_destroyed skips an empty list.
+    }
+    Ok(plan)
+}
+
+/// Keys of a JMAP `{key: true}` map, sorted (lowercased for keywords).
+fn true_keys(v: Option<&Value>, lower: bool) -> Vec<String> {
+    let keys = v
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter(|(_, b)| b.as_bool().unwrap_or(false))
+                .map(|(k, _)| if lower { k.to_ascii_lowercase() } else { k.clone() })
+                .collect()
+        })
+        .unwrap_or_default();
+    sorted(keys)
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// If the target's Email `state` token hasn't moved since the end of the

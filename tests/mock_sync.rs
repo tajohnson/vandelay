@@ -157,6 +157,8 @@ fn export_email_already_exists_is_matched_not_failed() {
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -300,6 +302,8 @@ fn export_mailbox_name_collision_merges_without_create() {
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -437,6 +441,8 @@ fn export_mailbox_role_matched_syncs_mismatched_subscription() {
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -583,6 +589,8 @@ fn export_mailbox_already_exists_maps_existing_id() {
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -751,6 +759,8 @@ fn email_export_sends_one_email_per_import_call() {
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -920,6 +930,8 @@ fn export_email_blob_not_found_reuploads_and_retries() {
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -1058,6 +1070,8 @@ fn export_email_parallel_imports_each_email() {
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -1195,6 +1209,8 @@ fn export_email_parallel_thousand_emails() {
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -1295,6 +1311,8 @@ fn export_email_assume_not_deleted_skips_existence_verification() {
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: true,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -1427,6 +1445,8 @@ fn export_email_assume_not_deleted_recreates_a_message_whose_cached_id_is_stale(
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: true,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -1566,6 +1586,8 @@ fn export_email_assume_not_deleted_creates_new_rows_without_full_target_fetch() 
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: true,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -1678,6 +1700,8 @@ fn export_email_matching_target_state_skips_verification_with_no_flag() {
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -1787,6 +1811,8 @@ fn export_email_mismatched_target_state_falls_back_to_verification() {
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -1899,6 +1925,8 @@ fn export_email_prune_removes_source_deleted_and_forgets_cache_row() {
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -2048,6 +2076,8 @@ fn export_email_parallel_blob_not_found_self_heals() {
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -2233,6 +2263,8 @@ fn export_cfg_objects(base: &str, objects: Vec<ObjectType>) -> ExportConfig {
         yes: true,
         acl: false,
         assume_not_deleted_in_destination: false,
+        update_matched: false,
+        create_only: false,
     }
 }
 
@@ -4784,6 +4816,8 @@ fn export_email_batches_blob_upload_when_server_supports_it() {
             yes: true,
             acl: false,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
         },
     )
     .expect("export run");
@@ -4829,6 +4863,8 @@ fn acl_export_config(base: &str) -> ExportConfig {
     ExportConfig {
         acl: true,
         assume_not_deleted_in_destination: false,
+        update_matched: false,
+        create_only: false,
         ..export_cfg_objects(base, vec![ObjectType::Mailbox])
     }
 }
@@ -4939,6 +4975,8 @@ fn export_acl_proceeds_even_when_target_does_not_advertise_sharing_capabilities(
         ExportConfig {
             acl: true,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
             ..export_cfg_objects(&base, vec![])
         },
     )
@@ -5101,6 +5139,8 @@ fn export_acl_standalone_via_objects_resolves_existing_mailboxes_without_creatin
         ExportConfig {
             acl: true,
             assume_not_deleted_in_destination: false,
+            update_matched: false,
+            create_only: false,
             ..export_cfg_objects(&base, vec![])
         },
     )

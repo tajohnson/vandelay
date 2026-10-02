@@ -98,7 +98,13 @@ enum Attempt {
 
 impl HttpClient {
     pub fn new(auth: Auth, retry: RetryPolicy, allow_invalid_certs: bool) -> Self {
+        // Read timeouts: without them a source that stalls mid-body (Stalwart 0.12 on a
+        // stalled S3 GET, whose S3 timeout covers only the connect) hangs the run forever.
+        // A timeout surfaces as a transport error, which the retry policy retries.
         let config: Config = Config::builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(30)))
+            .timeout_recv_response(Some(std::time::Duration::from_secs(120)))
+            .timeout_recv_body(Some(std::time::Duration::from_secs(600)))
             .http_status_as_error(false)
             .redirect_auth_headers(RedirectAuthHeaders::SameHost)
             .tls_config(

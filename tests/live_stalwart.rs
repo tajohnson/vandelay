@@ -257,6 +257,8 @@ fn acl_round_trips_through_import_and_export() {
         yes: false,
         acl: true,
         assume_not_deleted_in_destination: false,
+        update_matched: false,
+        create_only: false,
     };
     let export_summary = sync::export::run(common(&archive), export_cfg).expect("export");
     assert!(

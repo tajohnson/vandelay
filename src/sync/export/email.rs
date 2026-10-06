@@ -131,15 +131,15 @@ pub fn reconcile(
         );
     }
 
-    let mut uploader = Uploader::new(net, &ctx.conn);
+    let mut items: Vec<(i64, &EmailRow)> = Vec::new();
     for (i, key) in local_keys.iter().enumerate() {
         if target_keys.contains(key) {
             counts.skipped += 1;
             continue;
         }
-        let (local_id, row) = &local[i];
-        export_one(net, &mut uploader, maps, *local_id, row, counts, logger);
+        items.push((local[i].0, &local[i].1));
     }
+    export_many(ctx, net, maps, &items, counts, logger)?;
 
     Ok(Plan::default())
 }
@@ -293,11 +293,9 @@ fn reconcile_paired(
         }
     }
 
-    let mut uploader = Uploader::new(net, &ctx.conn);
-    for i in unpaired_local {
-        let (local_id, row) = &local[i];
-        export_one(net, &mut uploader, maps, *local_id, row, counts, logger);
-    }
+    let items: Vec<(i64, &EmailRow)> =
+        unpaired_local.iter().map(|&i| (local[i].0, &local[i].1)).collect();
+    export_many(ctx, net, maps, &items, counts, logger)?;
 
     let mut plan = Plan::default();
     if net.prune {
@@ -380,6 +378,60 @@ fn import_item(
         "keywords": Value::Object(kw),
         "receivedAt": received_at,
     })
+}
+
+/// Export `items` over up to `-j` workers. Each worker opens its own archive connection
+/// (a rusqlite Connection is not Sync), its own Uploader and its own HTTP connections
+/// (`HttpClient::fork`); the forks share the gate on the server's maxConcurrentUpload
+/// (see export::run). Emails are independent
+/// Email/import calls, so their order does not matter.
+fn export_many(
+    ctx: &Context,
+    net: &Net,
+    maps: &Maps,
+    items: &[(i64, &EmailRow)],
+    counts: &mut TypeCounts,
+    logger: &Logger,
+) -> Result<(), Error> {
+    let workers = ctx.common.threads.max(1).min(items.len().max(1));
+    if workers <= 1 || net.dry_run {
+        let mut uploader = Uploader::new(net, &ctx.conn);
+        for (local_id, row) in items {
+            export_one(net, &mut uploader, maps, *local_id, row, counts, logger);
+        }
+        return Ok(());
+    }
+    let archive = ctx.common.archive.as_path();
+    let results: Vec<Result<TypeCounts, Error>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|w| {
+                s.spawn(move || -> Result<TypeCounts, Error> {
+                    let conn = crate::db::init::open(archive)?;
+                    // Own connections: the upload and its Email/import go to one backend.
+                    let wnet = Net { client: net.client.fork(), ..net.clone() };
+                    let net = &wnet;
+                    let mut uploader = Uploader::new(net, &conn);
+                    let mut c = TypeCounts::default();
+                    for (local_id, row) in items.iter().skip(w).step_by(workers) {
+                        export_one(net, &mut uploader, maps, *local_id, row, &mut c, logger);
+                    }
+                    Ok(c)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("email export worker panicked"))
+            .collect()
+    });
+    for r in results {
+        let c = r?;
+        counts.created += c.created;
+        counts.updated += c.updated;
+        counts.skipped += c.skipped;
+        counts.failed += c.failed;
+    }
+    Ok(())
 }
 
 fn export_one(

@@ -68,7 +68,6 @@ impl RetryPolicy {
 }
 
 struct Inner {
-    agent: Agent,
     auth: Auth,
     retry: RetryPolicy,
     allow_invalid_certs: bool,
@@ -87,9 +86,32 @@ enum Kind {
     Upload,
 }
 
+/// `inner` (auth, retry policy, rate-limit state, request/upload gates, counters) is shared
+/// by every clone and fork; `agent` (the connection pool) is per handle, so `fork()` gives a
+/// worker its own connections. Parallel email export needs that: an upload and the
+/// Email/import that uses it must reach the same backend (behind HAProxy, a blob uploaded
+/// through one Stalwart 0.16 node was intermittently `blobNotFound` on another).
 #[derive(Clone)]
 pub struct HttpClient {
     inner: Arc<Inner>,
+    agent: Agent,
+}
+
+fn new_agent(allow_invalid_certs: bool) -> Agent {
+    let config: Config = Config::builder()
+        .http_status_as_error(false)
+        .redirect_auth_headers(RedirectAuthHeaders::SameHost)
+        .tls_config(
+            TlsConfig::builder()
+                .unversioned_rustls_crypto_provider(std::sync::Arc::new(
+                    rustls::crypto::aws_lc_rs::default_provider(),
+                ))
+                .root_certs(RootCerts::PlatformVerifier)
+                .disable_verification(allow_invalid_certs)
+                .build(),
+        )
+        .build();
+    config.new_agent()
 }
 
 enum Attempt {
@@ -104,22 +126,9 @@ enum Attempt {
 
 impl HttpClient {
     pub fn new(auth: Auth, retry: RetryPolicy, allow_invalid_certs: bool) -> Self {
-        let config: Config = Config::builder()
-            .http_status_as_error(false)
-            .redirect_auth_headers(RedirectAuthHeaders::SameHost)
-            .tls_config(
-                TlsConfig::builder()
-                    .unversioned_rustls_crypto_provider(std::sync::Arc::new(
-                        rustls::crypto::aws_lc_rs::default_provider(),
-                    ))
-                    .root_certs(RootCerts::PlatformVerifier)
-                    .disable_verification(allow_invalid_certs)
-                    .build(),
-            )
-            .build();
         HttpClient {
+            agent: new_agent(allow_invalid_certs),
             inner: Arc::new(Inner {
-                agent: config.new_agent(),
                 auth,
                 retry,
                 allow_invalid_certs,
@@ -131,6 +140,14 @@ impl HttpClient {
                 retries_total: AtomicU64::new(0),
                 retry_after_sleeps: AtomicU64::new(0),
             }),
+        }
+    }
+
+    /// Same auth, limits, gates and counters; a new connection pool.
+    pub fn fork(&self) -> HttpClient {
+        HttpClient {
+            inner: Arc::clone(&self.inner),
+            agent: new_agent(self.inner.allow_invalid_certs),
         }
     }
 
@@ -385,7 +402,6 @@ impl HttpClient {
         let started = Instant::now();
         let result = if let Some(payload) = body {
             let mut req = self
-                .inner
                 .agent
                 .post(url)
                 .header("Authorization", auth)
@@ -395,8 +411,7 @@ impl HttpClient {
             }
             req.send(payload)
         } else {
-            self.inner
-                .agent
+            self.agent
                 .get(url)
                 .header("Authorization", auth)
                 .header("Accept", "application/json")

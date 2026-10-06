@@ -154,6 +154,10 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
         prune: config.prune,
     };
 
+    // Gate uploads and requests at the server's advertised limits, so parallel email
+    // export (-j) waits client-side instead of collecting maxConcurrentUpload rejections.
+    net.client.set_limits(&net.limits);
+
     let work = work_list(&ctx.conn, &config, &connected, &logger);
     let mut maps = Maps::default();
     let mut summary = Summary::default();

@@ -1217,6 +1217,13 @@ pub struct ExchangeGraphImportArgs {
     )]
     allow_source_change: bool,
 
+    #[arg(
+        long,
+        value_name = "REGEX",
+        help = "Mail folder exclude filter against the '/'-joined folder path (repeatable); a match drops the folder and everything under it"
+    )]
+    exclude: Vec<String>,
+
     #[command(flatten)]
     global: GlobalArgs,
 
@@ -1256,6 +1263,7 @@ fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action
         .graph_connections
         .clamp(1, 16)
         .min(common.threads.max(1));
+    let exclude = compile_regexes(&args.exclude, "--exclude")?;
     Ok(Action::ImportExchangeGraph(
         common,
         GraphImportConfig {
@@ -1271,6 +1279,7 @@ fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action
             contact_photos: !args.skip_contact_photos,
             event_attachments: !args.skip_event_attachments,
             allow_source_change: args.allow_source_change,
+            exclude,
         },
     ))
 }

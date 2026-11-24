@@ -52,6 +52,9 @@ pub struct GraphImportConfig {
     pub contact_photos: bool,
     pub event_attachments: bool,
     pub allow_source_change: bool,
+    /// Mail folders to skip, matched against the '/'-joined display-name path;
+    /// a match takes the folder's whole subtree with it.
+    pub exclude: Vec<regex::Regex>,
 }
 
 pub const CHUNK_SIZE: usize = 100;
@@ -67,6 +70,7 @@ pub struct GraphCoordinator<'a> {
     pub exception_window_years: i32,
     pub contact_photos: bool,
     pub event_attachments: bool,
+    pub exclude: &'a [regex::Regex],
 }
 
 pub fn run(common: CommonConfig, config: GraphImportConfig) -> Result<Summary, Error> {
@@ -117,6 +121,7 @@ pub fn run(common: CommonConfig, config: GraphImportConfig) -> Result<Summary, E
             config.mailbox_kind,
             &logger,
             config.top,
+            &config.exclude,
         );
     }
 
@@ -159,6 +164,7 @@ pub fn run(common: CommonConfig, config: GraphImportConfig) -> Result<Summary, E
         exception_window_years: config.exception_window_years,
         contact_photos: config.contact_photos,
         event_attachments: config.event_attachments,
+        exclude: &config.exclude,
     };
 
     let primary = !matches!(config.mailbox_kind, MailboxKind::Archive);
@@ -223,12 +229,17 @@ fn run_dry(
     mailbox_kind: MailboxKind,
     logger: &crate::logging::Logger,
     top: usize,
+    exclude: &[regex::Regex],
 ) -> Result<Summary, Error> {
     let mut mailbox_counts = TypeCounts::default();
     let mut calendar_counts = TypeCounts::default();
     let mut addressbook_counts = TypeCounts::default();
     let folders =
         enumerate_mail_folders(client, endpoints, mailbox_kind, top).map_err(Error::from)?;
+    let (folders, dropped) = super::folders::drop_excluded(folders, exclude);
+    if !dropped.is_empty() && logger.enabled(LEVEL_DEFAULT) {
+        eprintln!("dry-run: mail folders excluded: {}", dropped.join(", "));
+    }
     mailbox_counts.created = folders.len() as u64;
     if !matches!(mailbox_kind, MailboxKind::Archive) {
         let calendars =
@@ -600,6 +611,7 @@ mod tests {
             contact_photos: true,
             event_attachments: true,
             allow_source_change: false,
+            exclude: Vec::new(),
         };
         let url = canonical_session_url(&config);
         assert_eq!(

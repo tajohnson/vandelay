@@ -14,7 +14,7 @@ use crate::error::Error;
 use crate::exchange_graph::api;
 use crate::exchange_graph::calendar_map::{graph_calendar_color_to_hex, windows_or_iana_to_iana};
 use crate::exchange_graph::types::MailboxKind;
-use crate::logging::LEVEL_PROGRESS;
+use crate::logging::{LEVEL_DEFAULT, LEVEL_PROGRESS};
 use crate::sync::TypeCounts;
 use crate::types::ObjectType;
 
@@ -41,6 +41,75 @@ pub struct ContactFolder {
     pub local_id: i64,
 }
 
+/// Drops every mail folder whose '/'-joined display-name path matches one of
+/// `exclude`, and everything under it, so an excluded parent never leaves an
+/// orphan behind. Same patterns as `import imap --exclude` on an Exchange
+/// source, e.g. `^(Sync Issues|Outbox)(/|$)`. Returns the kept folders and the
+/// sorted paths of the dropped ones.
+pub fn drop_excluded(server: Vec<Value>, exclude: &[regex::Regex]) -> (Vec<Value>, Vec<String>) {
+    if exclude.is_empty() {
+        return (server, Vec::new());
+    }
+    let mut by_id: HashMap<String, (Option<String>, String)> = HashMap::new();
+    for v in &server {
+        if let Some(id) = v.get("id").and_then(Value::as_str) {
+            let parent = v
+                .get("parentFolderId")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let name = v
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or("Unnamed")
+                .to_owned();
+            by_id.insert(id.to_owned(), (parent, name));
+        }
+    }
+    // Ancestors inside the listing, nearest first (the root folder is not listed).
+    let ancestors = |id: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = by_id.get(id).and_then(|(p, _)| p.clone());
+        while let Some(c) = cur {
+            if out.len() > 64 || !by_id.contains_key(&c) {
+                break;
+            }
+            cur = by_id.get(&c).and_then(|(p, _)| p.clone());
+            out.push(c);
+        }
+        out
+    };
+    let path_of = |id: &str| -> String {
+        let mut parts: Vec<String> = ancestors(id)
+            .iter()
+            .rev()
+            .filter_map(|a| by_id.get(a).map(|(_, n)| n.clone()))
+            .collect();
+        parts.push(by_id.get(id).map(|(_, n)| n.clone()).unwrap_or_default());
+        parts.join("/")
+    };
+    let matched: std::collections::HashSet<String> = by_id
+        .keys()
+        .filter(|id| exclude.iter().any(|r| r.is_match(&path_of(id))))
+        .cloned()
+        .collect();
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for v in server {
+        let id = v
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if matched.contains(&id) || ancestors(&id).iter().any(|a| matched.contains(a)) {
+            dropped.push(path_of(&id));
+        } else {
+            kept.push(v);
+        }
+    }
+    dropped.sort();
+    (kept, dropped)
+}
+
 pub fn reconcile_mail(
     conn: &mut Connection,
     ctx: &GraphCoordinator<'_>,
@@ -51,6 +120,10 @@ pub fn reconcile_mail(
         .map_err(Error::from)?;
     if ctx.logger.enabled(LEVEL_PROGRESS) {
         eprintln!("graph mailFolders enumerated: {}", server.len());
+    }
+    let (server, dropped) = drop_excluded(server, ctx.exclude);
+    if !dropped.is_empty() && ctx.logger.enabled(LEVEL_DEFAULT) {
+        eprintln!("graph mail folders excluded: {}", dropped.join(", "));
     }
     let well_known = match mailbox_kind {
         MailboxKind::Primary => resolve_well_known_roles(ctx),
@@ -555,6 +628,52 @@ fn depth_of(id: i64, parents: &HashMap<i64, Option<i64>>) -> usize {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn drop_excluded_takes_whole_subtrees_by_path() {
+        let server = vec![
+            json!({"id": "I", "parentFolderId": "ROOT", "displayName": "Inbox"}),
+            json!({"id": "S", "parentFolderId": "ROOT", "displayName": "Sync Issues"}),
+            json!({"id": "C", "parentFolderId": "S", "displayName": "Conflicts"}),
+            json!({"id": "D", "parentFolderId": "C", "displayName": "Deeper"}),
+            json!({"id": "K", "parentFolderId": "I", "displayName": "Sync Issues"}),
+            json!({"id": "O", "parentFolderId": "ROOT", "displayName": "Outbox"}),
+        ];
+        let ex = vec![regex::Regex::new(r"^(Sync Issues|Outbox)(/|$)").unwrap()];
+        let (kept, dropped) = drop_excluded(server, &ex);
+        let ids: Vec<&str> = kept.iter().map(|v| v["id"].as_str().unwrap()).collect();
+        // Inbox/Sync Issues is a user folder under Inbox, not the top-level one: kept.
+        assert_eq!(ids, vec!["I", "K"]);
+        assert_eq!(
+            dropped,
+            vec![
+                "Outbox",
+                "Sync Issues",
+                "Sync Issues/Conflicts",
+                "Sync Issues/Conflicts/Deeper"
+            ]
+        );
+    }
+
+    #[test]
+    fn drop_excluded_drops_children_of_a_matched_parent_even_if_they_do_not_match() {
+        let server = vec![
+            json!({"id": "P", "parentFolderId": "ROOT", "displayName": "Junk"}),
+            json!({"id": "Q", "parentFolderId": "P", "displayName": "Keep me?"}),
+        ];
+        let ex = vec![regex::Regex::new(r"^Junk$").unwrap()];
+        let (kept, dropped) = drop_excluded(server, &ex);
+        assert!(kept.is_empty());
+        assert_eq!(dropped, vec!["Junk", "Junk/Keep me?"]);
+    }
+
+    #[test]
+    fn drop_excluded_without_patterns_keeps_everything() {
+        let server = vec![json!({"id": "A", "displayName": "Outbox"})];
+        let (kept, dropped) = drop_excluded(server, &[]);
+        assert_eq!(kept.len(), 1);
+        assert!(dropped.is_empty());
+    }
 
     #[test]
     fn order_by_parent_returns_parents_first() {

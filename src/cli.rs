@@ -1138,6 +1138,14 @@ pub struct ExchangeGraphImportArgs {
 
     #[arg(
         long,
+        value_name = "PATH",
+        conflicts_with = "access_token",
+        help = "File holding an app-only bearer token that another process keeps fresh; re-read every 30 s"
+    )]
+    access_token_file: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
         value_name = "LIST",
         help = "Comma-separated surface list: mail | calendar | contacts | files (default: all)"
     )]
@@ -1233,6 +1241,7 @@ fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action
     let event_body_format = args.event_body_format;
     let auth = resolve_graph_auth(
         args.access_token.as_ref(),
+        args.access_token_file.as_deref(),
         args.client_id.as_deref(),
         &args.tenant,
     )?;
@@ -1268,9 +1277,26 @@ fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action
 
 fn resolve_graph_auth(
     access_token: Option<&Option<String>>,
+    access_token_file: Option<&std::path::Path>,
     client_id: Option<&str>,
     tenant: &str,
 ) -> Result<GraphAuth, Error> {
+    if let Some(path) = access_token_file {
+        let token = std::fs::read_to_string(path)
+            .map_err(|e| Error::Usage(format!("--access-token-file {}: {e}", path.display())))?
+            .trim()
+            .to_owned();
+        if token.is_empty() {
+            return Err(Error::Usage(format!(
+                "--access-token-file {} is empty",
+                path.display()
+            )));
+        }
+        return Ok(GraphAuth::TokenFile {
+            path: path.to_path_buf(),
+            token,
+        });
+    }
     if let Some(slot) = access_token {
         let token = secret::resolve(slot.as_deref(), "VANDELAY_GRAPH_TOKEN", "bearer token")?;
         return Ok(GraphAuth::PreAcquired { token });
@@ -1351,6 +1377,37 @@ mod tests {
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
         M.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn temp_token_file(tag: &str, content: &str) -> std::path::PathBuf {
+        let p = env::temp_dir().join(format!("vandelay-test-{tag}-{}", std::process::id()));
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    #[test]
+    fn graph_access_token_file_resolves_trimmed() {
+        let p = temp_token_file("tokfile", "  eyJ.a.b \n");
+        let r = resolve_graph_auth(None, Some(&p), None, "common");
+        let _ = std::fs::remove_file(&p);
+        match r {
+            Ok(GraphAuth::TokenFile { path, token }) => {
+                assert_eq!(path, p);
+                assert_eq!(token, "eyJ.a.b");
+            }
+            other => panic!("expected TokenFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graph_access_token_file_empty_is_usage_error() {
+        let p = temp_token_file("tokempty", " \n");
+        let r = resolve_graph_auth(None, Some(&p), None, "common");
+        let _ = std::fs::remove_file(&p);
+        match r {
+            Err(Error::Usage(m)) => assert!(m.contains("is empty"), "msg was: {m}"),
+            other => panic!("expected Usage error, got {other:?}"),
+        }
     }
 
     #[test]

@@ -26,6 +26,12 @@ pub enum GraphAuth {
     PreAcquired {
         token: String,
     },
+    /// App-only token that another process keeps fresh (a client-credentials loop):
+    /// read once here, then re-read by the refresher thread whenever the file changes.
+    TokenFile {
+        path: std::path::PathBuf,
+        token: String,
+    },
     DeviceCode {
         authority: String,
         client_id: String,
@@ -76,7 +82,12 @@ pub fn run(common: CommonConfig, config: GraphImportConfig) -> Result<Summary, E
     client.set_logger(logger);
 
     let endpoints = resolve_endpoints(&config, &client)?;
-    let principal = resolve_principal(&client, &endpoints, acquired.upn.as_deref())?;
+    let principal = resolve_principal(
+        &client,
+        &endpoints,
+        acquired.upn.as_deref(),
+        config.user_target.as_deref(),
+    )?;
 
     let session_url = canonical_session_url(&config);
     let account_id = synthetic_account_id(&principal.id, config.mailbox_kind);
@@ -283,9 +294,11 @@ pub fn enumerate_mail_folders(
 
 fn acquire_with_flow(auth: &GraphAuth, allow_invalid_certs: bool) -> Result<AcquiredToken, Error> {
     let flow = match auth {
-        GraphAuth::PreAcquired { token } => OAuthFlow::PreAcquired {
-            token: token.clone(),
-        },
+        GraphAuth::PreAcquired { token } | GraphAuth::TokenFile { token, .. } => {
+            OAuthFlow::PreAcquired {
+                token: token.clone(),
+            }
+        }
         GraphAuth::DeviceCode {
             authority,
             client_id,
@@ -302,8 +315,13 @@ fn resolve_endpoints(config: &GraphImportConfig, client: &GraphClient) -> Result
         let resolved = if looks_like_uuid(target) {
             target.to_owned()
         } else {
-            resolve_user_id(client, &config.api_base, target)
-                .map_err(|e| Error::Connection(format!("user resolution: {e}")))?
+            match resolve_user_id(client, &config.api_base, target) {
+                Ok(id) => id,
+                // An app-only token scoped to mailboxes (Exchange RBAC for Applications)
+                // cannot read the directory; Graph takes the address in the path as well.
+                Err(GraphError::Auth(_)) => target.to_owned(),
+                Err(e) => return Err(Error::Connection(format!("user resolution: {e}"))),
+            }
         };
         Ok(Endpoints::for_user(&config.api_base, &resolved))
     } else {
@@ -342,9 +360,22 @@ fn resolve_principal(
     client: &GraphClient,
     endpoints: &Endpoints,
     fallback_upn: Option<&str>,
+    user_target: Option<&str>,
 ) -> Result<crate::exchange_graph::ResolvedPrincipal, Error> {
     let url = endpoints.me_select_id_upn();
-    let value = client.get_json(&url).map_err(Error::from)?;
+    let value = match client.get_json(&url) {
+        Ok(v) => v,
+        // Same as resolve_endpoints: no directory read for a mailbox-scoped app token.
+        // The --user value then names the account, so later runs must pass the same one.
+        Err(GraphError::Auth(_)) if user_target.is_some() => {
+            let target = user_target.unwrap_or_default().to_owned();
+            return Ok(crate::exchange_graph::ResolvedPrincipal {
+                id: target.clone(),
+                user_principal_name: target,
+            });
+        }
+        Err(e) => return Err(Error::from(e)),
+    };
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -365,7 +396,7 @@ fn resolve_principal(
 fn canonical_session_url(config: &GraphImportConfig) -> String {
     let authority = match &config.auth {
         GraphAuth::DeviceCode { authority, .. } => authority.clone(),
-        GraphAuth::PreAcquired { .. } => default_authority("common"),
+        GraphAuth::PreAcquired { .. } | GraphAuth::TokenFile { .. } => default_authority("common"),
     };
     format!(
         "{}|{}",
@@ -387,6 +418,9 @@ fn spawn_token_refresher(
             client_id,
         } => (authority.clone(), client_id.clone()),
         GraphAuth::PreAcquired { .. } => return None,
+        GraphAuth::TokenFile { path, token } => {
+            return spawn_token_file_watcher(client, path.clone(), token.clone(), logger);
+        }
     };
     let refresh = initial.refresh_token.clone()?;
     let mut deadline_unix = initial_deadline_unix(initial)?;
@@ -440,6 +474,60 @@ fn spawn_token_refresher(
                         ));
                         std::thread::sleep(std::time::Duration::from_secs(60));
                     }
+                }
+            }
+        })
+        .ok()?;
+    Some(TokenRefresher {
+        shutdown,
+        handle: Some(handle),
+    })
+}
+
+/// Re-reads an app-only token file every 30 s and hands a changed token to the client.
+/// The file's writer refreshes it well inside the hour Microsoft gives each token; a
+/// read error or an empty file keeps the current token.
+fn spawn_token_file_watcher(
+    client: &GraphClient,
+    path: std::path::PathBuf,
+    initial: String,
+    logger: crate::logging::Logger,
+) -> Option<TokenRefresher> {
+    let client = client.clone();
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_signal = shutdown.clone();
+    let handle = std::thread::Builder::new()
+        .name("vandelay-graph-token-file".to_owned())
+        .spawn(move || {
+            let mut current = initial;
+            let mut ticks = 0u32;
+            while !shutdown_signal.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                ticks += 1;
+                if ticks < 15 {
+                    continue;
+                }
+                ticks = 0;
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        let token = text.trim();
+                        if !token.is_empty() && token != current {
+                            client.set_bearer(token.to_owned());
+                            current = token.to_owned();
+                            let exp = crate::exchange_graph::oauth::decode_jwt_claims(&current)
+                                .and_then(|c| c.exp)
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "?".to_owned());
+                            logger.warn(&format!(
+                                "graph token reloaded from {} (exp {exp})",
+                                path.display()
+                            ));
+                        }
+                    }
+                    Err(e) => logger.warn(&format!(
+                        "graph token file {}: {e}; keeping the current token",
+                        path.display()
+                    )),
                 }
             }
         })
